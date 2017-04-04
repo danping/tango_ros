@@ -83,6 +83,12 @@ enum LocalizationMode {
   LOCALIZATION = 3
 };
 
+enum LocalizationStatus {
+  LOCALIZING,
+  LOCALIZED,
+  LOCALIZATION_LOST
+};
+
 enum class TangoStatus {
   UNKNOWN = 0,
   SERVICE_NOT_BOUND,
@@ -181,10 +187,14 @@ class TangoRosNode {
   std::condition_variable color_image_available_;
 
   double time_offset_ = 0.; // Offset between tango time and ros time in s.
+  int localization_mode_;
+  LocalizationStatus localization_status_ = LOCALIZING;
+
 
   tf::TransformBroadcaster tf_broadcaster_;
+  geometry_msgs::TransformStamped start_of_service_T_area_description_;
+  geometry_msgs::TransformStamped area_description_T_device_;
   geometry_msgs::TransformStamped start_of_service_T_device_;
-  geometry_msgs::TransformStamped area_description_T_start_of_service_;
   tf2_ros::StaticTransformBroadcaster tf_static_broadcaster_;
   geometry_msgs::TransformStamped device_T_camera_depth_;
   tf::StampedTransform camera_depth_T_laser_;

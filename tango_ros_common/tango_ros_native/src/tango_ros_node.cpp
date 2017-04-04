@@ -229,6 +229,16 @@ std::string toFrameId(const TangoCoordinateFrameType& tango_frame_type) {
   }
   return string_frame_type;
 }
+// Check that the base and target frames of a TangoCoordinateFramePair match
+// the given base and target frames.
+// @param frame_pair TangoCoordinateFramePair to check.
+// @param base the expected base frame
+// @param target the expected target frame
+bool framePairMatches(TangoCoordinateFramePair frame_pair,
+                      TangoCoordinateFrameType base,
+                      TangoCoordinateFrameType target) {
+  return (frame_pair.base == base && frame_pair.target == target);
+}
 // Converts TangoCameraIntrinsics to sensor_msgs::CameraInfo.
 // See Tango documentation:
 // http://developers.google.com/tango/apis/unity/reference/class/tango/tango-camera-intrinsics
@@ -372,6 +382,16 @@ TangoRosNode::TangoRosNode() : run_threads_(false), tango_config_(nullptr) {
                   &TangoRosNode::TangoConnectServiceCallback, this, _1, _2));
 
   tango_status_ = TangoStatus::UNKNOWN;
+
+  if (localization_mode_ != (int) LocalizationMode::ODOMETRY) {
+    // Initialize start_of_service_T_area_description as identity.
+    tf::StampedTransform start_of_service_T_area_description =
+        tf::StampedTransform(tf::Transform(tf::Quaternion(0, 0, 0, 1)),
+                             ros::Time::now(),
+                             toFrameId(TANGO_COORDINATE_FRAME_START_OF_SERVICE),
+                             toFrameId(TANGO_COORDINATE_FRAME_AREA_DESCRIPTION));
+    tf::transformStampedTFToMsg(start_of_service_T_area_description, start_of_service_T_area_description_);
+  }
 }
 
 TangoRosNode::~TangoRosNode() {
@@ -447,10 +467,9 @@ TangoErrorType TangoRosNode::TangoSetupConfig() {
   }
   if (!create_new_map) {
     bool enable_drift_correction = false;
-    int localization_mode;
-    node_handle_.param(LOCALIZATION_MODE_PARAM_NAME, localization_mode,
-                       (int)LocalizationMode::ONLINE_SLAM);
-    if (localization_mode == LocalizationMode::ONLINE_SLAM) {
+    node_handle_.param(LOCALIZATION_MODE_PARAM_NAME, localization_mode_,
+                       (int) LocalizationMode::ONLINE_SLAM);
+    if (localization_mode_ == LocalizationMode::ONLINE_SLAM) {
       enable_drift_correction = true;
     }
     const char* config_enable_drift_correction = "config_enable_drift_correction";
@@ -460,7 +479,7 @@ TangoErrorType TangoRosNode::TangoSetupConfig() {
           << config_enable_drift_correction << " error: " << result;
       return result;
     }
-    if (localization_mode == LocalizationMode::LOCALIZATION) {
+    if (localization_mode_ == LocalizationMode::LOCALIZATION) {
       std::string map_uuid_to_load = "";
       node_handle_.param<std::string>(LOCALIZATION_MAP_UUID_PARAM_NAME, map_uuid_to_load, "");
       const char* config_load_area_description_UUID = "config_load_area_description_UUID";
@@ -524,12 +543,15 @@ TangoErrorType TangoRosNode::TangoSetupConfig() {
 TangoErrorType TangoRosNode::TangoConnect() {
   const char* function_name = "TangoRosNode::TangoConnect()";
 
-  TangoCoordinateFramePair pair;
-  pair.base = TANGO_COORDINATE_FRAME_START_OF_SERVICE;
-  pair.target = TANGO_COORDINATE_FRAME_DEVICE;
-
+  const uint32_t num_frame_pairs_to_listen = 2;
+  TangoCoordinateFramePair pairs[num_frame_pairs_to_listen] = {
+      { TANGO_COORDINATE_FRAME_START_OF_SERVICE,
+        TANGO_COORDINATE_FRAME_DEVICE }, {
+        TANGO_COORDINATE_FRAME_AREA_DESCRIPTION,
+        TANGO_COORDINATE_FRAME_DEVICE }
+  };
   TangoErrorType result;
-  result = TangoService_connectOnPoseAvailable(1, &pair, onPoseAvailableRouter);
+  result = TangoService_connectOnPoseAvailable(num_frame_pairs_to_listen, pairs, onPoseAvailableRouter);
   if (result != TANGO_SUCCESS) {
     LOG(ERROR) << function_name
         << ", TangoService_connectOnPoseAvailable error: " << result;
@@ -672,30 +694,89 @@ void TangoRosNode::PublishStaticTransforms() {
 }
 
 void TangoRosNode::OnPoseAvailable(const TangoPoseData* pose) {
-  if (pose->frame.base == TANGO_COORDINATE_FRAME_START_OF_SERVICE
-      && pose->frame.target == TANGO_COORDINATE_FRAME_DEVICE) {
+  if (framePairMatches(pose->frame, TANGO_COORDINATE_FRAME_START_OF_SERVICE,
+                       TANGO_COORDINATE_FRAME_DEVICE)) {
     if (pose->status_code == TANGO_POSE_VALID && pose_available_mutex_.try_lock()) {
-      toTransformStamped(*pose, time_offset_, &start_of_service_T_device_);
-      start_of_service_T_device_.header.frame_id =
-        toFrameId(TANGO_COORDINATE_FRAME_START_OF_SERVICE);
-      start_of_service_T_device_.child_frame_id =
-        toFrameId(TANGO_COORDINATE_FRAME_DEVICE);
-      TangoCoordinateFramePair pair;
-      pair.base = TANGO_COORDINATE_FRAME_AREA_DESCRIPTION;
-      pair.target = TANGO_COORDINATE_FRAME_START_OF_SERVICE;
-      TangoPoseData area_description_T_start_of_service;
-      TangoService_getPoseAtTime(0.0, pair, &area_description_T_start_of_service);
-      if (area_description_T_start_of_service.status_code == TANGO_POSE_VALID) {
-        toTransformStamped(area_description_T_start_of_service,
-                           time_offset_, &area_description_T_start_of_service_);
-        area_description_T_start_of_service_.header.frame_id =
-            toFrameId(TANGO_COORDINATE_FRAME_AREA_DESCRIPTION);
-        area_description_T_start_of_service_.child_frame_id =
+      if (localization_mode_ == (int) LocalizationMode::ODOMETRY) {
+        // Localization is not used, publish device wrt. start_of_service.
+        toTransformStamped(*pose, time_offset_, &start_of_service_T_device_);
+        start_of_service_T_device_.header.frame_id =
             toFrameId(TANGO_COORDINATE_FRAME_START_OF_SERVICE);
+        start_of_service_T_device_.child_frame_id =
+            toFrameId(TANGO_COORDINATE_FRAME_DEVICE);
+      } else if (localization_status_ == LocalizationStatus::LOCALIZING) {
+        // We are not localized yet, start_of_service_T_area_description is
+        // the identity.
+        toTransformStamped(*pose, time_offset_, &area_description_T_device_);
+        area_description_T_device_.header.frame_id =
+            toFrameId(TANGO_COORDINATE_FRAME_AREA_DESCRIPTION);
+        area_description_T_device_.child_frame_id =
+            toFrameId(TANGO_COORDINATE_FRAME_DEVICE);
+        start_of_service_T_area_description_.header.stamp = ros::Time::now();
+      } else if (localization_status_ == LocalizationStatus::LOCALIZATION_LOST) {
+        LOG(WARNING) << "Recovering tracking...";
+        // Localization was lost, use old start_of_service_T_area_description
+        // to compute area_description_T_device.
+        geometry_msgs::TransformStamped start_of_service_T_device;
+        toTransformStamped(*pose, time_offset_, &start_of_service_T_device);
+        start_of_service_T_device.header.frame_id =
+            toFrameId(TANGO_COORDINATE_FRAME_START_OF_SERVICE);
+        start_of_service_T_device.child_frame_id =
+            toFrameId(TANGO_COORDINATE_FRAME_DEVICE);
+
+        start_of_service_T_area_description_.header.stamp = ros::Time::now();
+
+        tf::StampedTransform start_of_service_T_device_tf;
+        tf::StampedTransform start_of_service_T_area_description_tf;
+        tf::transformStampedMsgToTF(start_of_service_T_device,
+                                    start_of_service_T_device_tf);
+        tf::transformStampedMsgToTF(start_of_service_T_area_description_,
+                                    start_of_service_T_area_description_tf);
+        tf::Transform area_description_T_device_tf =
+            start_of_service_T_area_description_tf.inverse() * start_of_service_T_device_tf;
+        tf::transformStampedTFToMsg(tf::StampedTransform(
+            area_description_T_device_tf, start_of_service_T_device.header.stamp,
+            toFrameId(TANGO_COORDINATE_FRAME_AREA_DESCRIPTION),
+            toFrameId(TANGO_COORDINATE_FRAME_DEVICE)), area_description_T_device_);
       }
       pose_available_.notify_all();
       pose_available_mutex_.unlock();
     }
+  } else if (framePairMatches(pose->frame, TANGO_COORDINATE_FRAME_AREA_DESCRIPTION,
+                              TANGO_COORDINATE_FRAME_DEVICE)) {
+    if (pose->status_code == TANGO_POSE_VALID && pose_available_mutex_.try_lock()) {
+      // We are localized, update area_description_T_device and
+      // start_of_service_T_area_description transforms.
+      toTransformStamped(*pose, time_offset_, &area_description_T_device_);
+      area_description_T_device_.header.frame_id =
+          toFrameId(TANGO_COORDINATE_FRAME_AREA_DESCRIPTION);
+      area_description_T_device_.child_frame_id =
+          toFrameId(TANGO_COORDINATE_FRAME_DEVICE);
+
+      TangoCoordinateFramePair pair;
+      pair.base = TANGO_COORDINATE_FRAME_START_OF_SERVICE;
+      pair.target = TANGO_COORDINATE_FRAME_AREA_DESCRIPTION;
+      TangoPoseData start_of_service_T_area_description;
+      TangoService_getPoseAtTime(0.0, pair, &start_of_service_T_area_description);
+      if (start_of_service_T_area_description.status_code == TANGO_POSE_VALID) {
+        toTransformStamped(start_of_service_T_area_description,
+                           time_offset_, &start_of_service_T_area_description_);
+        start_of_service_T_area_description_.header.frame_id =
+            toFrameId(TANGO_COORDINATE_FRAME_START_OF_SERVICE);
+        start_of_service_T_area_description_.child_frame_id =
+            toFrameId(TANGO_COORDINATE_FRAME_AREA_DESCRIPTION);
+      }
+      localization_status_ = LocalizationStatus::LOCALIZED;
+
+      pose_available_.notify_all();
+      pose_available_mutex_.unlock();
+    } else if (pose->status_code == TANGO_POSE_INVALID) {
+      // We've just lost localization.
+      LOG(WARNING) << "Tracking has been lost, please walk around to recover tracking";
+      localization_status_ = LocalizationStatus::LOCALIZATION_LOST;
+    }
+    pose_available_.notify_all();
+    pose_available_mutex_.unlock();
   }
 }
 
@@ -808,10 +889,11 @@ void TangoRosNode::PublishDevicePose() {
     {
       std::unique_lock<std::mutex> lock(pose_available_mutex_);
       pose_available_.wait(lock);
-      tf_broadcaster_.sendTransform(start_of_service_T_device_);
-      if (area_description_T_start_of_service_.child_frame_id != "") {
-        // This transform can be empty. Don't publish it in this case.
-        tf_broadcaster_.sendTransform(area_description_T_start_of_service_);
+      if (localization_mode_ == (int) LocalizationMode::ODOMETRY) {
+        tf_broadcaster_.sendTransform(start_of_service_T_device_);
+      } else {
+        tf_broadcaster_.sendTransform(start_of_service_T_area_description_);
+        tf_broadcaster_.sendTransform(area_description_T_device_);
       }
     }
   }
