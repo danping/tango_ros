@@ -626,9 +626,9 @@ TangoErrorType TangoRosNode::ConnectToTangoAndSetUpNode() {
   // Create publishing threads.
   StartPublishing();
   UpdateAndPublishTangoStatus(TangoStatus::SERVICE_CONNECTED);
+  tango_data_available_ = true;
   return success;
 }
-
 
 void TangoRosNode::TangoDisconnect() {
   StopPublishing();
@@ -848,37 +848,50 @@ void TangoRosNode::StartPublishing() {
 }
 
 void TangoRosNode::StopPublishing() {
+  LOG(INFO) << "Stop publishing";
   if (run_threads_) {
     run_threads_ = false;
     if (publish_device_pose_thread_.joinable()) {
+      if (!tango_data_available_) {
+        std::unique_lock<std::mutex> lock(pose_available_mutex_);
+        pose_available_.notify_all();
+        pose_available_mutex_.unlock();
+      }
       publish_device_pose_thread_.join();
     }
+    LOG(INFO) << "Stop publishing pose";
     if (publish_pointcloud_thread_.joinable()) {
-      if (point_cloud_publisher_.getNumSubscribers() <= 0) {
+      if (!tango_data_available_ || point_cloud_publisher_.getNumSubscribers() <= 0) {
         point_cloud_available_.notify_all();
       }
       publish_pointcloud_thread_.join();
     }
+    LOG(INFO) << "Stop publishing point cloud";
     if (publish_laserscan_thread_.joinable()) {
-      if (laser_scan_publisher_.getNumSubscribers() <= 0) {
+      if (!tango_data_available_ || laser_scan_publisher_.getNumSubscribers() <= 0) {
         laser_scan_available_.notify_all();
       }
       publish_laserscan_thread_.join();
     }
+    LOG(INFO) << "Stop publishing laser scan";
     if (publish_fisheye_image_thread_.joinable()) {
-      if (fisheye_camera_publisher_.getNumSubscribers() <= 0) {
+      if (!tango_data_available_ || fisheye_camera_publisher_.getNumSubscribers() <= 0) {
         fisheye_image_available_.notify_all();
       }
       publish_fisheye_image_thread_.join();
     }
+    LOG(INFO) << "Stop publishing fisheye camera";
     if (publish_color_image_thread_.joinable()) {
-      if (color_camera_publisher_.getNumSubscribers() <= 0) {
+      if (!tango_data_available_ || color_camera_publisher_.getNumSubscribers() <= 0) {
         color_image_available_.notify_all();
       }
       publish_color_image_thread_.join();
     }
+    LOG(INFO) << "Stop publishing color camera";
     ros_spin_thread_.join();
+    LOG(INFO) << "Stop spin";
   }
+  LOG(INFO) << "Stop publishing over";
 }
 
 void TangoRosNode::PublishDevicePose() {
@@ -1090,8 +1103,10 @@ bool TangoRosNode::SaveMap(tango_ros_messages::SaveMap::Request &req,
     return true;
   }
 
-  res.message =  "Map successfully saved with the following name: " + map_name;
+  std::string map_uuid_string = static_cast<std::string>(map_uuid);
+  res.message =  "Map " + map_uuid_string + " successfully saved with the following name: " + map_name;
   res.success = true;
+  tango_data_available_ = false;
   return true;
 }
 
